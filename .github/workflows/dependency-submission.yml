@@ -1,0 +1,131 @@
+name: Dependency Submission
+
+on:
+  push:
+    branches: [ master ]
+    paths:
+      - 'vcpkg.json'
+  pull_request:
+    branches: [ master ]
+    paths:
+      - 'vcpkg.json'
+  schedule:
+    # Run weekly on Sundays at 00:00 UTC
+    - cron: '0 0 * * 0'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  dependency-submission:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Parse vcpkg.json and submit dependencies
+      uses: actions/github-script@v7
+      with:
+        script: |
+          const fs = require('fs');
+          const path = require('path');
+          
+          try {
+            // Read and parse vcpkg.json
+            const vcpkgPath = path.join(process.env.GITHUB_WORKSPACE, 'vcpkg.json');
+            const vcpkgContent = fs.readFileSync(vcpkgPath, 'utf8');
+            const vcpkgData = JSON.parse(vcpkgContent);
+            
+            console.log('Parsed vcpkg.json:', vcpkgData);
+            
+            // Extract dependencies
+            const dependencies = vcpkgData.dependencies || [];
+            console.log('Found dependencies:', dependencies);
+            
+            if (dependencies.length === 0) {
+              console.log('No dependencies found in vcpkg.json');
+              return;
+            }
+            
+            // Create dependency snapshot
+            const snapshot = {
+              version: 0,
+              sha: context.sha,
+              ref: context.ref,
+              job: {
+                correlator: `${context.workflow}-${context.job}`,
+                id: context.runId.toString()
+              },
+              detector: {
+                name: 'vcpkg-dependency-submission',
+                version: '1.0.0',
+                url: 'https://github.com/microsoft/vcpkg'
+              },
+              metadata: {},
+              manifests: {}
+            };
+            
+            // Create manifest for vcpkg.json
+            const manifestKey = 'vcpkg.json';
+            snapshot.manifests[manifestKey] = {
+              name: manifestKey,
+              file: {
+                source_location: 'vcpkg.json'
+              },
+              metadata: {},
+              resolved: {}
+            };
+            
+            // Add each dependency to the manifest
+            dependencies.forEach((dep, index) => {
+              let depName, depVersion = null;
+              
+              // Handle different dependency formats
+              if (typeof dep === 'string') {
+                depName = dep;
+              } else if (typeof dep === 'object' && dep.name) {
+                depName = dep.name;
+                if (dep.version || dep['version-string'] || dep['version>=']) {
+                  depVersion = dep.version || dep['version-string'] || dep['version>='];
+                }
+              } else {
+                console.warn(`Skipping invalid dependency format: ${JSON.stringify(dep)}`);
+                return;
+              }
+              
+              const packageUrl = `pkg:vcpkg/${depName}${depVersion ? `@${depVersion}` : ''}`;
+              
+              snapshot.manifests[manifestKey].resolved[packageUrl] = {
+                package_url: packageUrl,
+                metadata: {
+                  name: depName,
+                  version: depVersion || 'latest'
+                }
+              };
+            });
+            
+            console.log('Generated dependency snapshot:', JSON.stringify(snapshot, null, 2));
+            
+            // Submit to Dependency Submission API
+            try {
+              const response = await github.rest.dependencyGraph.createRepositorySnapshot({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                ...snapshot
+              });
+              
+              console.log('Successfully submitted dependency snapshot');
+              console.log('Response:', response.data);
+              
+            } catch (apiError) {
+              console.error('Error submitting to Dependency Submission API:', apiError);
+              throw apiError;
+            }
+            
+          } catch (error) {
+            console.error('Error processing vcpkg.json:', error);
+            throw error;
+          }
